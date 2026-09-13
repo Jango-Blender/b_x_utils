@@ -1,316 +1,337 @@
-const std: type = @import("std");
+const std = @import("std");
+const py = @import("python");
+const pyb = @import("py_bindings.zig");
+const pyo = pyb.object_types;
 
-const py_wr = @import("py_wrapper_funcs.zig");
-const py = py_wr.py;
+const Name = @import("structs.zig").Name;
 
-pub const Allocator: type = std.mem.Allocator;
+const Allocator = std.mem.Allocator;
+const XaReader = @import("XaReader.zig");
+const OnceSetterSafeGetter = @import("meta.zig").OnceSetterSafeGetter;
 
-const dr_module = @import("data_reader.zig");
-const DataReader: type = dr_module.DataReader;
-const Vector3df = dr_module.Vector3df;
+const TerrainError = error {
+    UnknownTTileChunk,
+    UnknownTerrainBlock,
+    InvalidTerrain,
+    SectorOutOfBounds,
+    TerrainTileNotFound,
+};
 
-const print = std.debug.print;
+const SECTOR_WIDTH = std.math.divCeil(comptime_int, 0xF1, 8) catch unreachable;
 
-pub const TerrainError: type = error{ UnknownTTileChunk, UnknownTerrainBlock, InvalidTerrain, SectorOutOfBounds, TerrainTileNotFound };
+const TSECTOR_SIZE = SECTOR_WIDTH * SECTOR_WIDTH;
+const SECTOR_FACES_N = (SECTOR_WIDTH - 1) * (SECTOR_WIDTH - 1);
 
-const sector_width = (0xF1 / 8) + 1;
-
-const TSECTOR_SIZE = sector_width * sector_width;
-
-const BrushSector: type = struct { name: [16]u8 = @splat(0), map: [TSECTOR_SIZE]u8 = @splat(0) };
-
-const sector_face_amount = (sector_width - 1) * (sector_width - 1);
-const TerrainSector: type = struct {
-    pos_x: u32 = 0,
-    pos_y: u32 = 0,
-    scale: f32 = 20.0,
-    heightmap: [TSECTOR_SIZE]f32 = @splat(0),
-    brushes: []BrushSector = &.{},
+const BrushSector = struct { name: Name, map: [TSECTOR_SIZE]u8 };
+const TerrainSector = struct {
+    pos_x: u32,
+    pos_y: u32,
+    scale: f32,
+    heightmap: [TSECTOR_SIZE]f32,
+    brushes: []BrushSector,
     //holes
-    pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("TerrainSector(pos_x=0x{x}, pos_y=0x{x}, scale={}, min_height={}, max_height={}, brushes_n=0x{x})\n", .{ self.pos_x, self.pos_y, self.scale, std.mem.min(f32, &self.heightmap), std.mem.max(f32, &self.heightmap), self.brushes.len });
     }
-    pub fn heightmap_to_positions_py(self: @This()) ?*py.PyObject {
-        const pos_offset = -self.scale * sector_width / 2;
-        const vectors_list = py.PyList_New(TSECTOR_SIZE);
+    fn heightmap_to_positions_py(self: @This()) !pyo.ListObject {
+        const pos_offset = -self.scale * SECTOR_WIDTH / 2;
+        const vectors_list: pyo.ListObject = try .initPlaceholders(TSECTOR_SIZE);
         const vertical_scaling = self.scale * 0.1;
-        for (0..sector_width) |y| {
-            const y_pos = @as(f32, @floatFromInt(y)) * self.scale + pos_offset;
-            for (0..sector_width) |x| {
-                const tuple = py.PyTuple_New(3);
-                _ = py.PyTuple_SetItem(tuple, 0, py.PyFloat_FromDouble(@as(f32, @floatFromInt(x)) * self.scale + pos_offset));
-                _ = py.PyTuple_SetItem(tuple, 1, py.PyFloat_FromDouble(y_pos));
-                _ = py.PyTuple_SetItem(tuple, 2, py.PyFloat_FromDouble(self.heightmap[y * sector_width + x] * vertical_scaling));
-                _ = py.PyList_SetItem(vectors_list, @intCast(y * sector_width + x), tuple);
+        for (0..SECTOR_WIDTH) |y_usize| {
+            const y: u8 = @intCast(y_usize);
+            const y_pos = @as(f32, y) * self.scale + pos_offset;
+            for (0..SECTOR_WIDTH) |x_usize| {
+                const x: u8 = @intCast(x_usize);
+                const tuple: pyo.TupleObject = try .initPlaceholders(3);
+                tuple.setUnchecked(0, try pyb.float(@as(f32, x) * self.scale + pos_offset));
+                tuple.setUnchecked(1, try pyb.float(y_pos));
+                tuple.setUnchecked(2, try pyb.float(self.heightmap[y * SECTOR_WIDTH + x] * vertical_scaling));
+                vectors_list.setUnchecked(y * SECTOR_WIDTH + x, tuple);
             }
         }
         return vectors_list;
     }
-    pub fn generate_face_indices_py(self: @This()) ?*py.PyObject {
+    pub fn generate_face_indices_py(self: @This()) !pyo.ListObject {
         _ = self;
-        const face_width = sector_width - 1;
-        const faces_list = py.PyList_New(face_width * face_width);
+        const face_width = SECTOR_WIDTH - 1;
+        const faces_list: pyo.ListObject = try .initPlaceholders(face_width * face_width);
         for (0..face_width) |y| {
             for (0..face_width) |x| {
-                const vertex: u32 = @intCast(y * sector_width + x);
-                const tuple = py.PyTuple_New(4);
-                _ = py.PyTuple_SetItem(tuple, 0, py.PyLong_FromUnsignedLong(vertex));
-                _ = py.PyTuple_SetItem(tuple, 1, py.PyLong_FromUnsignedLong(vertex + 1));
-                _ = py.PyTuple_SetItem(tuple, 2, py.PyLong_FromUnsignedLong(vertex + sector_width + 1));
-                _ = py.PyTuple_SetItem(tuple, 3, py.PyLong_FromUnsignedLong(vertex + sector_width));
-                _ = py.PyList_SetItem(faces_list, @intCast((y * face_width + x)), tuple);
+                const vertex = y * SECTOR_WIDTH + x;
+                const tuple: pyo.TupleObject = try .initPlaceholders(4);
+                tuple.setUnchecked(0, try pyb.long(vertex));
+                tuple.setUnchecked(1, try pyb.long(vertex + 1));
+                tuple.setUnchecked(2, try pyb.long(vertex + SECTOR_WIDTH + 1));
+                tuple.setUnchecked(3, try pyb.long(vertex + SECTOR_WIDTH));
+                faces_list.setUnchecked(y * face_width + x, tuple);
             }
         }
         return faces_list;
     }
-    pub fn convert_brushes_to_py(self: @This()) ?*py.PyObject {
-        const brushes_list = py.PyList_New(@intCast(self.brushes.len));
+    pub fn convert_brushes_to_py(self: @This()) !pyo.ListObject {
+        const brushes_list: pyo.ListObject = try .initPlaceholders(self.brushes.len);
         for (self.brushes, 0..self.brushes.len) |brush, i| {
-            const tuple = py.PyTuple_New(2);
-            const clean_name = std.mem.trimEnd(u8, brush.name[0..], "\x00");
-            _ = py.PyTuple_SetItem(tuple, 0, py.PyUnicode_Decode(clean_name.ptr, @intCast(clean_name.len), "cp1252", null));
-            const brush_weight_list = py.PyList_New(TSECTOR_SIZE);
+            const tuple: pyo.TupleObject = try .initPlaceholders(2);
+            
+            const clean_name = std.mem.sliceTo(&brush.name.bytes, 0);
+            tuple.setUnchecked(0, try pyo.UnicodeObject.from(clean_name, .cp1252));
+            
+            const brush_weight_list: pyo.ListObject = try .initPlaceholders(TSECTOR_SIZE);
             for (brush.map, 0..TSECTOR_SIZE) |val, j| { // Values range from [0,255]. Convert them to [0.0,1.0]
-                _ = py.PyList_SetItem(brush_weight_list, @intCast(j), py.PyFloat_FromDouble(@as(f32, @floatFromInt(val)) / 255.0));
+                brush_weight_list.setUnchecked(j, try pyb.float(@as(f32, val) / 255.0));
             }
-            _ = py.PyTuple_SetItem(tuple, 1, brush_weight_list);
-            _ = py.PyList_SetItem(brushes_list, @intCast(i), tuple);
+            tuple.setUnchecked(1, brush_weight_list);
+            
+            brushes_list.setUnchecked(i, tuple);
         }
         return brushes_list;
     }
 };
 
-pub const Brush: type = struct { name: [16]u8 = @splat(0), map: [0xF1 * 0xF1]u8 = @splat(0) };
-
-pub fn read_brush(dr: *DataReader) Brush {
-    var brush: Brush = .{};
-    brush.name = dr.read_name();
-    dr.fill_u8_arr(&brush.map);
-    return brush;
-}
-
-pub const TTile: type = struct {
-    hole_flag: u32 = 0,
-    pos_x: u32 = 0,
-    pos_y: u32 = 0,
-    u3: u32 = 0,
-    heightmap: [0xF4 * 0xF4]f32 = @splat(0),
-    brushes: []Brush = &.{},
+const Brush = extern struct { name: Name, map: [0xF1 * 0xF1]u8 };
+const TTile = struct {
+    hole_flag: u32,
+    pos_x: u32,
+    pos_y: u32,
+    u3: u32,
+    heightmap: [0xF4 * 0xF4]f32,
+    brushes: []Brush,
     //Holemap data structure is unknown. hold the raw data if it's present.
-    hole_data: [0x1D2F]u8 = @splat(0),
-    pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    hole_data: [0x1D2F]u8,
+    fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("TTile(hole_flag=0x{x}, pos_x=0x{x}, pos_y=0x{x}, u3=0x{x}, min_height={}, max_height={}, brushes_n=0x{x})\n", .{ self.hole_flag, self.pos_x, self.pos_y, self.u3, std.mem.min(f32, &self.heightmap), std.mem.max(f32, &self.heightmap), self.brushes.len });
     }
-    pub fn get_sector(self: @This(), pos_x: u32, pos_y: u32, scale: f32, allocator: Allocator) !TerrainSector {
+    fn get_sector(self: @This(), arena: Allocator, pos_x: u32, pos_y: u32, scale: f32) !TerrainSector {
+        const brushes = try arena.alloc(BrushSector, self.brushes.len);
+        //Copy the names only once.
+        for (self.brushes, brushes) |tile_brush, *sector_brush| {
+            sector_brush.name = tile_brush.name;
+        }
+
         const l_pos_x = pos_x % 8; //Relative to the tile's corner
         const l_pos_y = pos_y % 8;
-        const start_x = l_pos_x * (sector_width - 1); //Positions on the grid
-        const start_y = l_pos_y * (sector_width - 1);
-        var sector: TerrainSector = .{ .pos_x = pos_x, .pos_y = pos_y, .scale = scale, .brushes = try allocator.alloc(BrushSector, self.brushes.len) };
-
-        //Copy the names only once.
-        for (self.brushes, sector.brushes) |t_brush, *s_brush| {
-            s_brush.name = t_brush.name;
-        }
-
-        for (0..sector_width) |y| {
+        const start_x = l_pos_x * (SECTOR_WIDTH - 1); //Positions on the grid
+        const start_y = l_pos_y * (SECTOR_WIDTH - 1);
+        
+        var heightmap: [TSECTOR_SIZE]f32 = @splat(0); // Does every byte of this get replaced by the following loop? If so, the initialization value should be undefined.
+        for (0..SECTOR_WIDTH) |y| {
             const h_src_start = (start_y + y) * 0xF4 + start_x;
-            const dst_start = y * sector_width;
+            const dst_start = y * SECTOR_WIDTH;
 
-            @memcpy(sector.heightmap[dst_start .. dst_start + sector_width], self.heightmap[h_src_start .. h_src_start + sector_width]);
+            @memcpy(heightmap[dst_start..][0..SECTOR_WIDTH], self.heightmap[h_src_start..][0..SECTOR_WIDTH]);
 
             const b_src_start = (start_y + y) * 0xF1 + start_x;
-            for (self.brushes, sector.brushes) |t_brush, *s_brush| {
-                @memcpy(s_brush.map[dst_start .. dst_start + sector_width], t_brush.map[b_src_start .. b_src_start + sector_width]);
+            for (self.brushes, brushes) |tile_brush, *sector_brush| {
+                @memcpy(sector_brush.map[dst_start..][0..SECTOR_WIDTH], tile_brush.map[b_src_start..][0..SECTOR_WIDTH]);
             }
         }
-        return sector;
+        return .{
+            .pos_x = pos_x,
+            .pos_y = pos_y,
+            .scale = scale,
+            .brushes = brushes,
+            .heightmap = heightmap,
+        };
     }
 };
 
-pub fn read_ttile(dr: *DataReader, length: u32, allocator: Allocator) !TTile {
-    const start = dr.pos;
-    var tile: TTile = .{};
-    tile.hole_flag = dr.read_u32();
-    tile.pos_x = dr.read_u32();
-    tile.pos_y = dr.read_u32();
-    tile.u3 = dr.read_u32();
-    dr.fill_f32_arr(&tile.heightmap);
-    if (tile.hole_flag & 0x200 != 0) {
-        dr.fill_u8_arr(&tile.hole_data);
+fn read_ttile(arena: Allocator, fixed: *XaReader, length: u32) !TTile {
+    const start = fixed.r.seek;
+    
+    const hole_flag = try fixed.take(u32);
+    const pos_x = try fixed.take(u32);
+    const pos_y = try fixed.take(u32);
+    const unknown = try fixed.take(u32);
+    
+    var heightmap: [0xF4 * 0xF4]f32 = undefined;
+    try fixed.readSlice(f32, &heightmap);
+    
+    var hole_data: [0x1D2F]u8 = @splat(0);
+    if (hole_flag & 0x200 != 0) {
+        try fixed.readSlice(u8, &hole_data);
     }
-    while (dr.pos - start < length) {
-        const chunk_start = dr.pos;
-        const signature = dr.read_u32();
-        const chunk_length = dr.read_u32();
+    
+    var chunks: OnceSetterSafeGetter(struct {
+        brushes: []Brush,
+    }) = .empty;
+    while (fixed.r.seek - start < length) {
+        const chunk_start = fixed.r.seek;
+        const signature = try fixed.take(u32);
+        const chunk_length = try fixed.take(u32);
         _ = chunk_length;
         switch (signature) {
             0xBD01 => {
-                const brushes_n = dr.read_u32();
-                tile.brushes = try allocator.alloc(Brush, brushes_n);
-                for (0..brushes_n) |i| {
-                    tile.brushes[i] = read_brush(dr);
-                }
+                const brushes_n = try fixed.take(u32);
+                const brushes = try arena.alloc(Brush, brushes_n);
+                try fixed.readSlice(Brush, brushes);
+                try chunks.set(.brushes, brushes);
             },
             else => {
-                print("Found an unknown terrain tile chunk 0x{x} starting @ 0x{x}\n", .{ signature, chunk_start });
+                std.debug.print("Found an unknown terrain tile chunk 0x{x} starting @ 0x{x}\n", .{ signature, chunk_start });
                 return error.UnknownTTileChunk;
             },
         }
     }
-    return tile;
+    return .{
+        .hole_flag = hole_flag,
+        .pos_x = pos_x,
+        .pos_y = pos_y,
+        .u3 = unknown,
+        .heightmap = heightmap,
+        .brushes = try chunks.get(.brushes),
+        .hole_data = hole_data,
+    };
 }
 
-const TileCoord: type = struct { x: u32, y: u32 };
+const TileCoord = struct { x: u32, y: u32 };
 
-pub const Terrain = struct {
-    arena: std.heap.ArenaAllocator,
-    unk: u32 = 0,
-    material: [16]u8 = @splat(0),
-    scale: f32 = 20,
-    dim_x: u32 = 1,
-    dim_y: u32 = 1,
+const Terrain = struct {
+    arena_state: std.heap.ArenaAllocator,
+    unk: u32,
+    material: Name,
+    scale: f32,
+    dim_x: u32,
+    dim_y: u32,
     tile_map: std.AutoHashMapUnmanaged(TileCoord, TTile),
 
-    pub fn init() Terrain {
-        return .{
-            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-            .tile_map = .{},
-        };
+    fn deinit(self: *Terrain) void {
+        self.arena_state.deinit();
     }
-    pub fn deinit(self: *Terrain) void {
-        self.arena.deinit();
-    }
-    pub fn format(self: *const @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    fn format(self: *const @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("Terrain(unk=0x{x}, material={s}, scale={}, dim_x=0x{x}, dim_y=0x{x}, tiles_n=0x{x})\n", .{ self.unk, std.mem.sliceTo(&self.material, 0), self.scale, self.dim_x, self.dim_y, self.tile_map.count() });
     }
-    pub fn get_sector(self: *@This(), pos_x: u32, pos_y: u32) !TerrainSector {
+    fn get_sector(self: *@This(), pos_x: u32, pos_y: u32) !TerrainSector {
         if (pos_x / 8 > self.dim_x or pos_x / 8 > self.dim_y) {
-            print("Sector (0x{x},0x{x}) is out of indexing range for terrain with dimensions (0x{x},0x{x})", .{ pos_x, pos_y, self.dim_x, self.dim_y });
+            std.debug.print("Sector (0x{x},0x{x}) is out of indexing range for terrain with dimensions (0x{x},0x{x})", .{ pos_x, pos_y, self.dim_x, self.dim_y });
             return error.SectorOutOfBounds;
         }
         const ttile = self.tile_map.get(.{ .x = pos_x / 8, .y = pos_y / 8 }) orelse {
-            print("Sector (0x{x},0x{x}) does not have a terrain tile! It would fit in tile (0x{x},0x{x})\n", .{ pos_x, pos_y, pos_x / 8, pos_y / 8 });
+            std.debug.print("Sector (0x{x},0x{x}) does not have a terrain tile! It would fit in tile (0x{x},0x{x})\n", .{ pos_x, pos_y, pos_x / 8, pos_y / 8 });
             return error.TerrainTileNotFound;
         };
-        return ttile.get_sector(pos_x, pos_y, self.scale, self.arena.allocator());
+        return ttile.get_sector(self.arena_state.allocator(), pos_x, pos_y, self.scale);
     }
-    pub fn get_brush_names_py(self: *@This()) !?*py.PyObject {
-        var brush_names = std.StringHashMap(void).init(self.arena.allocator());
-        defer brush_names.deinit();
+    pub fn get_brush_names_py(self: *@This()) !pyo.ListObject {
+        const arena = self.arena_state.allocator();
+        var brush_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer brush_names.deinit(arena);
 
         var tile_iter = self.tile_map.iterator();
         while (tile_iter.next()) |entry| {
             const tile = entry.value_ptr.*;
             for (tile.brushes) |*brush| {
-                const clean_name = std.mem.trimEnd(u8, brush.name[0..], "\x00");
-                try brush_names.put(clean_name, {});
+                const clean_name = std.mem.sliceTo(&brush.name.bytes, 0);
+                try brush_names.put(arena, clean_name, {});
             }
         }
-        const brush_name_list = py.PyList_New(@intCast(brush_names.count()));
+        const brush_name_list: pyo.ListObject = try .initPlaceholders(brush_names.count());
         var brush_iter = brush_names.iterator();
-        var brush_index: u32 = 0;
-        while (brush_iter.next()) |entry| {
+        var brush_index: usize = 0;
+        while (brush_iter.next()) |entry| : (brush_index += 1) {
             const brush_name = entry.key_ptr.*;
-            _ = py.PyList_SetItem(brush_name_list, brush_index, py.PyUnicode_Decode(brush_name.ptr, @intCast(brush_name.len), "cp1252", null));
-            brush_index += 1;
+            brush_name_list.setUnchecked(brush_index, try pyo.UnicodeObject.from(brush_name, .cp1252));
         }
         return brush_name_list;
     }
 };
 
-pub fn read_terrain(dr: *DataReader) !Terrain {
-    var terrain: Terrain = Terrain.init();
-    const allocator = terrain.arena.allocator();
-    terrain.unk = dr.read_u32();
-    terrain.material = dr.read_name();
-    terrain.scale = dr.read_f32();
-    terrain.dim_x = dr.read_u32();
-    terrain.dim_y = dr.read_u32();
-    const blocks_n = dr.read_u32();
+fn read_terrain(fixed: *XaReader) !Terrain {
+    var terrain: Terrain = .{
+        .arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator),
+        .unk = try fixed.take(u32),
+        .material = try fixed.take(Name),
+        .scale = try fixed.take(f32),
+        .dim_x = try fixed.take(u32),
+        .dim_y = try fixed.take(u32),
+        .tile_map = .empty
+    };
+    
+    const arena = terrain.arena_state.allocator();
+    
+    const blocks_n = try fixed.take(u32);
     for (0..blocks_n) |_| {
-        const block_start = dr.pos;
-        const block_sig = dr.read_u32();
-        const block_length = dr.read_u32();
+        const block_start = fixed.r.seek;
+        const block_sig = try fixed.take(u32);
+        const block_length = try fixed.take(u32);
         switch (block_sig) {
             0xBDAD => {
-                const ttile = try read_ttile(dr, block_length, allocator);
-                // print("{f}", .{ttile});
+                const ttile = try read_ttile(arena, fixed, block_length);
+                // std.debug.print("{f}", .{ttile});
 
-                try terrain.tile_map.put(allocator, .{ .x = ttile.pos_x, .y = ttile.pos_y }, ttile);
+                try terrain.tile_map.put(arena, .{ .x = ttile.pos_x, .y = ttile.pos_y }, ttile);
             },
             else => {
-                print("Found an unknown terrain block 0x{x} starting @ 0x{x}\n", .{ block_sig, block_start });
+                std.debug.print("Found an unknown terrain block 0x{x} starting @ 0x{x}\n", .{ block_sig, block_start });
                 return error.UnknownTTileChunk;
             },
         }
     }
+    
     return terrain;
 }
 
-var TerrainType: ?*py.PyTypeObject = null;
+var terrain_type: ?pyo.TypeObject = null;
 
-pub const TerrainObject = extern struct {
+const TerrainObject = extern struct {
     ob_base: py.PyObject,
-    terrain: ?*Terrain,
-    material: ?*py.PyObject,
+    terrain: *Terrain,
+    material: pyo.UnicodeObject,
 };
 
 fn terrain_dealloc(self_obj: ?*py.PyObject) callconv(.c) void {
     const self: *TerrainObject = @ptrCast(@alignCast(self_obj));
 
-    if (self.terrain) |terrain| {
-        terrain.arena.deinit();
-        std.heap.c_allocator.destroy(terrain);
-    }
+    self.terrain.arena_state.deinit();
+    std.heap.c_allocator.destroy(self.terrain);
 
     py.Py_TYPE(self_obj).*.tp_free.?(self_obj);
 }
 
-fn sector_to_py(sector: TerrainSector) ?*py.PyObject {
-    const result = py.PyTuple_New(3);
-    _ = py.PyTuple_SetItem(result, 0, sector.heightmap_to_positions_py());
-    _ = py.PyTuple_SetItem(result, 1, sector.generate_face_indices_py());
-    _ = py.PyTuple_SetItem(result, 2, sector.convert_brushes_to_py());
+fn sector_to_py(sector: TerrainSector) !pyo.TupleObject {
+    const result: pyo.TupleObject = try .initPlaceholders(3);
+    result.setUnchecked(0, try sector.heightmap_to_positions_py());
+    result.setUnchecked(1, try sector.generate_face_indices_py());
+    result.setUnchecked(2, try sector.convert_brushes_to_py());
     return result;
 }
 
 fn terrain_get_sector(self_obj: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
     const self: *TerrainObject = @ptrCast(@alignCast(self_obj));
 
-    const terrain = self.terrain orelse {
-        return null;
+    const terrain = self.terrain;
+
+    const pos_x: u32, const pos_y: u32 = blk:{
+        var pos_x_raw: c_uint = undefined;
+        var pos_y_raw: c_uint = undefined;
+        if (py.PyArg_ParseTuple(args, "II", &pos_x_raw, &pos_y_raw) == 0) return null;
+        break :blk .{@intCast(pos_x_raw), @intCast(pos_y_raw)};
     };
-
-    var pos_x: c_uint = undefined;
-    var pos_y: c_uint = undefined;
-
-    if (py.PyArg_ParseTuple(args, "II", &pos_x, &pos_y) == 0) {
-        return null;
-    }
+    
     const sector = terrain.get_sector(pos_x, pos_y) catch {
         return null;
     };
 
-    return sector_to_py(sector);
+    const ret_tuple = sector_to_py(sector) catch {
+        return null;
+    };
+    return ret_tuple.toObject().ptr;
 }
+
 
 fn terrain_get_brush_names(self_obj: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
     _ = args;
 
     const self: *TerrainObject = @ptrCast(@alignCast(self_obj));
 
-    const terrain = self.terrain orelse {
-        return null;
-    };
-    return terrain.get_brush_names_py() catch |err| {
+    const ret_collection = self.terrain.get_brush_names_py() catch |err| {
         std.debug.print("get_brush_names_py error: {}\n", .{err});
         _ = py.PyErr_NoMemory();
         return null;
     };
+    return ret_collection.toObject().ptr;
 }
 
-const Terrain_members = [_]py.PyMemberDef{
+const terrain_type_members = [_]py.PyMemberDef{
     .{
         .name = "material",
         .type = py.Py_T_OBJECT_EX,
@@ -321,7 +342,7 @@ const Terrain_members = [_]py.PyMemberDef{
     .{},
 };
 
-const Terrain_methods = [_]py.PyMethodDef{
+const terrain_type_methods = [_]py.PyMethodDef {
     .{
         .ml_name = "get_sector",
         .ml_meth = terrain_get_sector,
@@ -332,64 +353,65 @@ const Terrain_methods = [_]py.PyMethodDef{
         .ml_name = "get_brushes",
         .ml_meth = terrain_get_brush_names,
         .ml_flags = py.METH_VARARGS,
-        .ml_doc = "Get a terrain sector.",
+        .ml_doc = "Get brush names.",
     },
-    .{},
+    std.mem.zeroes(py.PyMethodDef),
 };
 
-const Terrain_slots = [_]py.PyType_Slot{
+const terrain_type_slots = [_]py.PyType_Slot{
     .{
         .slot = py.Py_tp_dealloc,
         .pfunc = @ptrCast(@constCast(&terrain_dealloc)),
     },
     .{
         .slot = py.Py_tp_methods,
-        .pfunc = @ptrCast(@constCast(&Terrain_methods)),
+        .pfunc = @ptrCast(@constCast(&terrain_type_methods)),
     },
     .{
         .slot = py.Py_tp_members,
-        .pfunc = @ptrCast(@constCast(&Terrain_members)),
+        .pfunc = @ptrCast(@constCast(&terrain_type_members)),
     },
-    .{},
+    std.mem.zeroes(py.PyType_Slot),
 };
 
-var Terrain_spec = py.PyType_Spec{
+var terrain_type_spec = py.PyType_Spec{
     .name = "x_rft_zig.Terrain",
     .basicsize = @sizeOf(TerrainObject),
     .itemsize = 0,
     .flags = py.Py_TPFLAGS_DEFAULT,
-    .slots = @ptrCast(@constCast(&Terrain_slots)),
+    .slots = @ptrCast(@constCast(&terrain_type_slots)),
 };
 
-pub fn parse_terrain_py(self: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+fn parse_terrain_py(self: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
     _ = self;
-
-    var ptr: []u8 = undefined;
-    var len: py.Py_ssize_t = undefined;
-
-    if (py.PyArg_ParseTuple(args, "y#", &ptr, &len) == 0) { //Read the args, check the format, fill in the zig ids with the unpacked result.
-        return null; // Python exception already set
-    }
-    const data: []u8 = ptr[0..@intCast(len)];
-    var dr: DataReader = .{ .data = data, .pos = 0 };
+    
+    //Read the args, check the format, fill in the zig ids with the unpacked result.
+    const bytestream: []u8 = blk:{
+        var bytestream_raw: [*]u8 = undefined;
+        var bytestream_len_raw: py.Py_ssize_t = undefined;
+        if (py.PyArg_ParseTuple(args, "y#", &bytestream_raw, &bytestream_len_raw) == 0) return null; // Python exception already set
+        break :blk bytestream_raw[0..@intCast(bytestream_len_raw)];
+    };
+    
+    var fixed: XaReader = .fixed(bytestream);
 
     const terrain_ptr = std.heap.c_allocator.create(Terrain) catch {
         return null;
     };
+    errdefer std.heap.c_allocator.destroy(terrain_ptr);
 
-    terrain_ptr.* = read_terrain(&dr) catch {
-        std.heap.c_allocator.destroy(terrain_ptr);
+    terrain_ptr.* = read_terrain(&fixed) catch {
         return null;
     };
 
-    const py_type = TerrainType orelse return null;
+    const py_type = if (terrain_type) |tt| tt.ptr else return null;
 
     const py_obj = py.PyType_GenericAlloc(py_type, 0) orelse return null;
 
     const obj: *TerrainObject = @ptrCast(@alignCast(py_obj));
     obj.terrain = terrain_ptr;
-    const material = std.mem.trimEnd(u8, terrain_ptr.material[0..], "\x00");
-    obj.material = py.PyUnicode_Decode(material.ptr, @intCast(material.len), "cp1252", null);
+    const material = std.mem.sliceTo(&terrain_ptr.material.bytes, 0);
+    obj.material = pyo.UnicodeObject.from(material, .cp1252) catch return null;
 
     return py_obj;
 }
@@ -401,12 +423,7 @@ var methods = [_]py.PyMethodDef{
         .ml_flags = py.METH_VARARGS,
         .ml_doc = "Parse a RFT",
     },
-    .{
-        .ml_name = null,
-        .ml_meth = null,
-        .ml_flags = 0,
-        .ml_doc = null,
-    },
+    std.mem.zeroes(py.PyMethodDef),
 };
 
 var module = py.PyModuleDef{
@@ -414,44 +431,27 @@ var module = py.PyModuleDef{
     .m_name = "x_rft_zig",
     .m_doc = "Zig RFT parser",
     .m_size = -1,
-    .m_methods = &methods[0],
+    .m_methods = &methods,
 };
 
 export fn PyInit_x_rft_zig() callconv(.c) ?*py.PyObject {
     const mod = py.PyModule_Create(&module) orelse return null;
+    
     //the PyMethodDef goes into the PyType_Slot which go into the PyType_Spec which goes into this
-    const type_obj = py.PyType_FromSpec(&Terrain_spec) orelse {
-        py.Py_DECREF(mod);
-        return null;
+    const type_obj = pyo.TypeObject.fromSpec(&terrain_type_spec) catch |err| switch (err) {
+        error.Failed => {
+            py.Py_DECREF(mod);
+            return null;
+        },
     };
 
-    TerrainType = @ptrCast(type_obj);
+    terrain_type = type_obj;
 
-    if (py.PyModule_AddObject(mod, "Terrain", type_obj) < 0) {
-        py.Py_DECREF(type_obj);
+    if (py.PyModule_AddObject(mod, "Terrain", type_obj.toObject().ptr) < 0) {
+        py.Py_DECREF(type_obj.toObject().ptr);
         py.Py_DECREF(mod);
         return null;
     }
 
     return mod;
 }
-
-// pub fn main(init: std.process.Init) !void {
-//     const cwd: std.Io.Dir = .cwd();
-
-//     const data: []u8 = try cwd.readFileAlloc(init.io, "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Exanima\\Resource\\exanimac1.rft", init.gpa, .unlimited);
-//     defer init.gpa.free(data);
-
-//     var dr: DataReader = .{ .data = data, .pos = 0 };
-//     const signature = dr.read_u32();
-//     if (signature != 0x3EEFAD01) {
-//         print("Was provided an incorrect terrain file. Signature = 0x{x}", .{signature});
-//         return error.InvalidTerrain;
-//     }
-
-//     var terrain: Terrain = try read_terrain(&dr);
-//     print("{f}", .{terrain});
-
-//     const tsector = try terrain.get_sector(16, 16);
-//     print("{f}", .{tsector});
-// }

@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
                 lib.step.dependOn(&pyconfig.step);
             }
         }
-
+        
         const py_tc = b.addTranslateC(.{
             .root_source_file = b.addWriteFiles().add("py_tc.h",
                 \\#define PY_SSIZE_T_CLEAN
@@ -63,13 +63,9 @@ pub fn build(b: *std.Build) void {
         py_tc.addIncludePath(b.path("cpython")); // look for pyconfig.h in here
         py_tc.addIncludePath(b.path("cpython/include"));
         const py_mod = py_tc.createModule();
-
+        
         lib.root_module.addImport("python", py_mod);
-
-        //lib.root_module.addIncludePath(b.path("cpython")); // look for pyconfig.h in here
-        //lib.root_module.addIncludePath(b.path("cpython/Include"));
-        // lib.root_module.addCSourceFile(.{ .file = b.path("py_module.c") });
-
+        
         const dest_sub_path = if (target.result.os.tag == .windows) b.fmt("{s}.pyd", .{module.name}) else b.fmt("{s}.so", .{module.name});
 
         const target_output = b.addInstallArtifact(lib, .{
