@@ -10,7 +10,7 @@ pub fn discard(self: *XaReader, length: u32) Io.Reader.Error!void {
     try self.r.discardAll(length);
 }
 pub fn fixed(buf: []u8) XaReader {
-    return .{.r = .fixed(buf)};
+    return .{ .r = .fixed(buf) };
 }
 pub fn take(self: *XaReader, T: type) Io.Reader.Error!T {
     return switch (@typeInfo(T)) {
@@ -21,5 +21,6 @@ pub fn take(self: *XaReader, T: type) Io.Reader.Error!T {
     };
 }
 pub fn readSlice(self: *XaReader, T: type, slice: []T) Io.Reader.Error!void {
+    // try self.r.readSliceAll(std.mem.sliceAsBytes(slice));
     try self.r.readSliceEndian(T, slice, .little);
 }

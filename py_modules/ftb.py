@@ -90,6 +90,7 @@ class Brush:
     def __repr__(self):
         return f'Brush(name={self.name})'
 
+
 @dataclass
 class MixedBrush:
     #0x40 bytes long
@@ -257,9 +258,9 @@ class FTB:
         nodes.clear()
         links.clear()
         node_tree_dict = {}
-        # for mbrush in self.mixed_brush_dict.values(): print(mbrush)
         brush_nodes = [(self.get_brush(name.lower()).build(rfp, node_tree, node_tree_dict),name) for name in brushes_to_build if self.get_brush(name,True)]
         mix_nodes = []
+        # base_brush = self.get_brush(list(self.mixed_brush_dict.keys())[0]).build(rfp, node_tree, node_tree_dict)
         for i,(b_node,name) in enumerate(brush_nodes):
             attr_node = nodes.new('ShaderNodeAttribute')
             attr_node.attribute_name = name
@@ -268,6 +269,7 @@ class FTB:
             mix_node.data_type,mix_node.blend_type = 'RGBA','ADD'
             mix_node.inputs[6].default_value = (0.0,0.0,0.0,1.0)
             links.new(attr_node.outputs['Factor'],mix_node.inputs['Factor'])
+            # links.new(base_brush.outputs['Color'],mix_node.inputs['A'])
             links.new(b_node.outputs['Color'],mix_node.inputs['B'])
             mix_nodes.append(mix_node)
 

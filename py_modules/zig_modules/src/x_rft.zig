@@ -9,7 +9,7 @@ const Allocator = std.mem.Allocator;
 const XaReader = @import("XaReader.zig");
 const OnceSetterSafeGetter = @import("meta.zig").OnceSetterSafeGetter;
 
-const TerrainError = error {
+const TerrainError = error{
     UnknownTTileChunk,
     UnknownTerrainBlock,
     InvalidTerrain,
@@ -29,19 +29,20 @@ const TerrainSector = struct {
     scale: f32,
     heightmap: [TSECTOR_SIZE]f32,
     brushes: []BrushSector,
-    //holes
+    holemap: [TSECTOR_SIZE]u1,
     fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("TerrainSector(pos_x=0x{x}, pos_y=0x{x}, scale={}, min_height={}, max_height={}, brushes_n=0x{x})\n", .{ self.pos_x, self.pos_y, self.scale, std.mem.min(f32, &self.heightmap), std.mem.max(f32, &self.heightmap), self.brushes.len });
     }
     fn heightmap_to_positions_py(self: @This()) !pyo.ListObject {
-        const pos_offset = -self.scale * SECTOR_WIDTH / 2;
+        // std.debug.print("Converting heightmap to py...\n", .{});
+        const pos_offset: f32 = -self.scale * SECTOR_WIDTH / 2;
         const vectors_list: pyo.ListObject = try .initPlaceholders(TSECTOR_SIZE);
-        const vertical_scaling = self.scale * 0.1;
+        const vertical_scaling: f32 = self.scale * 0.1; //Why do i need to divide the height?
         for (0..SECTOR_WIDTH) |y_usize| {
-            const y: u8 = @intCast(y_usize);
-            const y_pos = @as(f32, y) * self.scale + pos_offset;
+            const y: u16 = @intCast(y_usize);
+            const y_pos: f32 = @as(f32, y) * self.scale + pos_offset;
             for (0..SECTOR_WIDTH) |x_usize| {
-                const x: u8 = @intCast(x_usize);
+                const x: u16 = @intCast(x_usize);
                 const tuple: pyo.TupleObject = try .initPlaceholders(3);
                 tuple.setUnchecked(0, try pyb.float(@as(f32, x) * self.scale + pos_offset));
                 tuple.setUnchecked(1, try pyb.float(y_pos));
@@ -52,6 +53,7 @@ const TerrainSector = struct {
         return vectors_list;
     }
     pub fn generate_face_indices_py(self: @This()) !pyo.ListObject {
+        // std.debug.print("Generating face indices...\n", .{});
         _ = self;
         const face_width = SECTOR_WIDTH - 1;
         const faces_list: pyo.ListObject = try .initPlaceholders(face_width * face_width);
@@ -69,39 +71,54 @@ const TerrainSector = struct {
         return faces_list;
     }
     pub fn convert_brushes_to_py(self: @This()) !pyo.ListObject {
+        // std.debug.print("Converting brushes to py...\n", .{});
         const brushes_list: pyo.ListObject = try .initPlaceholders(self.brushes.len);
         for (self.brushes, 0..self.brushes.len) |brush, i| {
             const tuple: pyo.TupleObject = try .initPlaceholders(2);
-            
+
             const clean_name = std.mem.sliceTo(&brush.name.bytes, 0);
             tuple.setUnchecked(0, try pyo.UnicodeObject.from(clean_name, .cp1252));
-            
+
             const brush_weight_list: pyo.ListObject = try .initPlaceholders(TSECTOR_SIZE);
             for (brush.map, 0..TSECTOR_SIZE) |val, j| { // Values range from [0,255]. Convert them to [0.0,1.0]
                 brush_weight_list.setUnchecked(j, try pyb.float(@as(f32, val) / 255.0));
             }
             tuple.setUnchecked(1, brush_weight_list);
-            
+
             brushes_list.setUnchecked(i, tuple);
         }
         return brushes_list;
     }
+    pub fn convert_holemap_to_py(self: @This()) !pyo.ListObject {
+        const hole_list: pyo.ListObject = try .initPlaceholders(TSECTOR_SIZE);
+        for (0..SECTOR_WIDTH) |y| {
+            const y_index = y * SECTOR_WIDTH;
+            for (0..SECTOR_WIDTH) |x| {
+                const index: u16 = @intCast(y_index + x);
+                hole_list.setUnchecked(index, try pyb.long(self.holemap[index]));
+            }
+        }
+        return hole_list;
+    }
 };
 
-const Brush = extern struct { name: Name, map: [0xF1 * 0xF1]u8 };
+const Brush = extern struct {
+    name: Name,
+    map: [0xF1 * 0xF1]u8,
+};
 const TTile = struct {
     hole_flag: u32,
     pos_x: u32,
     pos_y: u32,
     u3: u32,
-    heightmap: [0xF4 * 0xF4]f32,
+    heightmap: []f32,
     brushes: []Brush,
-    //Holemap data structure is unknown. hold the raw data if it's present.
-    hole_data: [0x1D2F]u8,
+    holemap: [0xF1 * 0xF1]u1,
     fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("TTile(hole_flag=0x{x}, pos_x=0x{x}, pos_y=0x{x}, u3=0x{x}, min_height={}, max_height={}, brushes_n=0x{x})\n", .{ self.hole_flag, self.pos_x, self.pos_y, self.u3, std.mem.min(f32, &self.heightmap), std.mem.max(f32, &self.heightmap), self.brushes.len });
     }
     fn get_sector(self: @This(), arena: Allocator, pos_x: u32, pos_y: u32, scale: f32) !TerrainSector {
+        // std.debug.print("Getting sector (0x{x},0x{x})\n", .{ pos_x, pos_y });
         const brushes = try arena.alloc(BrushSector, self.brushes.len);
         //Copy the names only once.
         for (self.brushes, brushes) |tile_brush, *sector_brush| {
@@ -112,45 +129,59 @@ const TTile = struct {
         const l_pos_y = pos_y % 8;
         const start_x = l_pos_x * (SECTOR_WIDTH - 1); //Positions on the grid
         const start_y = l_pos_y * (SECTOR_WIDTH - 1);
-        
-        var heightmap: [TSECTOR_SIZE]f32 = @splat(0); // Does every byte of this get replaced by the following loop? If so, the initialization value should be undefined.
+
+        var heightmap: [TSECTOR_SIZE]f32 = undefined;
+        var holemap: [TSECTOR_SIZE]u1 = undefined;
         for (0..SECTOR_WIDTH) |y| {
             const h_src_start = (start_y + y) * 0xF4 + start_x;
             const dst_start = y * SECTOR_WIDTH;
-
             @memcpy(heightmap[dst_start..][0..SECTOR_WIDTH], self.heightmap[h_src_start..][0..SECTOR_WIDTH]);
-
             const b_src_start = (start_y + y) * 0xF1 + start_x;
+            @memcpy(holemap[dst_start..][0..SECTOR_WIDTH], self.holemap[b_src_start..][0..SECTOR_WIDTH]);
             for (self.brushes, brushes) |tile_brush, *sector_brush| {
                 @memcpy(sector_brush.map[dst_start..][0..SECTOR_WIDTH], tile_brush.map[b_src_start..][0..SECTOR_WIDTH]);
             }
         }
+        // std.debug.print("Found the sector!\n", .{});
         return .{
             .pos_x = pos_x,
             .pos_y = pos_y,
             .scale = scale,
             .brushes = brushes,
             .heightmap = heightmap,
+            .holemap = holemap,
         };
     }
 };
 
 fn read_ttile(arena: Allocator, fixed: *XaReader, length: u32) !TTile {
     const start = fixed.r.seek;
-    
+
     const hole_flag = try fixed.take(u32);
     const pos_x = try fixed.take(u32);
     const pos_y = try fixed.take(u32);
     const unknown = try fixed.take(u32);
-    
-    var heightmap: [0xF4 * 0xF4]f32 = undefined;
-    try fixed.readSlice(f32, &heightmap);
-    
-    var hole_data: [0x1D2F]u8 = @splat(0);
+
+    const heightmap = try arena.alloc(f32, 0xF4 * 0xF4); //Put it in the heap, not the stack. That was causing overflow errors.
+    try fixed.readSlice(f32, heightmap);
+
+    var holemap: [0xF1 * 0xF1]u1 = undefined;
     if (hole_flag & 0x200 != 0) {
-        try fixed.readSlice(u8, &hole_data);
+        const final_column_index = 30 * 8; //240
+        for (0..0xF1) |y| {
+            const y_pos = y * 0xF1;
+            for (0..30) |x| { //30 Full bytes to read and unpack into the holemap
+                var byte = try fixed.take(u8);
+                const base_index = y_pos + (x * 8);
+                for (0..8) |i| {
+                    holemap[base_index + i] = @intCast(byte & 1);
+                    byte >>= 1;
+                }
+            }
+            holemap[y_pos + final_column_index] = @intCast(try fixed.take(u8) & 1); //The final byte in the row. Discard the other 7 bits.
+        }
     }
-    
+
     var chunks: OnceSetterSafeGetter(struct {
         brushes: []Brush,
     }) = .empty;
@@ -179,7 +210,7 @@ fn read_ttile(arena: Allocator, fixed: *XaReader, length: u32) !TTile {
         .u3 = unknown,
         .heightmap = heightmap,
         .brushes = try chunks.get(.brushes),
-        .hole_data = hole_data,
+        .holemap = holemap,
     };
 }
 
@@ -243,11 +274,11 @@ fn read_terrain(fixed: *XaReader) !Terrain {
         .scale = try fixed.take(f32),
         .dim_x = try fixed.take(u32),
         .dim_y = try fixed.take(u32),
-        .tile_map = .empty
+        .tile_map = .empty,
     };
-    
+
     const arena = terrain.arena_state.allocator();
-    
+
     const blocks_n = try fixed.take(u32);
     for (0..blocks_n) |_| {
         const block_start = fixed.r.seek;
@@ -256,8 +287,6 @@ fn read_terrain(fixed: *XaReader) !Terrain {
         switch (block_sig) {
             0xBDAD => {
                 const ttile = try read_ttile(arena, fixed, block_length);
-                // std.debug.print("{f}", .{ttile});
-
                 try terrain.tile_map.put(arena, .{ .x = ttile.pos_x, .y = ttile.pos_y }, ttile);
             },
             else => {
@@ -266,7 +295,7 @@ fn read_terrain(fixed: *XaReader) !Terrain {
             },
         }
     }
-    
+    // std.debug.print("Finished reading rft...\n", .{});
     return terrain;
 }
 
@@ -288,10 +317,11 @@ fn terrain_dealloc(self_obj: ?*py.PyObject) callconv(.c) void {
 }
 
 fn sector_to_py(sector: TerrainSector) !pyo.TupleObject {
-    const result: pyo.TupleObject = try .initPlaceholders(3);
+    const result: pyo.TupleObject = try .initPlaceholders(4);
     result.setUnchecked(0, try sector.heightmap_to_positions_py());
     result.setUnchecked(1, try sector.generate_face_indices_py());
     result.setUnchecked(2, try sector.convert_brushes_to_py());
+    result.setUnchecked(3, try sector.convert_holemap_to_py());
     return result;
 }
 
@@ -300,13 +330,13 @@ fn terrain_get_sector(self_obj: ?*py.PyObject, args: ?*py.PyObject) callconv(.c)
 
     const terrain = self.terrain;
 
-    const pos_x: u32, const pos_y: u32 = blk:{
+    const pos_x: u32, const pos_y: u32 = blk: {
         var pos_x_raw: c_uint = undefined;
         var pos_y_raw: c_uint = undefined;
         if (py.PyArg_ParseTuple(args, "II", &pos_x_raw, &pos_y_raw) == 0) return null;
-        break :blk .{@intCast(pos_x_raw), @intCast(pos_y_raw)};
+        break :blk .{ @intCast(pos_x_raw), @intCast(pos_y_raw) };
     };
-    
+
     const sector = terrain.get_sector(pos_x, pos_y) catch {
         return null;
     };
@@ -316,7 +346,6 @@ fn terrain_get_sector(self_obj: ?*py.PyObject, args: ?*py.PyObject) callconv(.c)
     };
     return ret_tuple.toObject().ptr;
 }
-
 
 fn terrain_get_brush_names(self_obj: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
     _ = args;
@@ -342,7 +371,7 @@ const terrain_type_members = [_]py.PyMemberDef{
     .{},
 };
 
-const terrain_type_methods = [_]py.PyMethodDef {
+const terrain_type_methods = [_]py.PyMethodDef{
     .{
         .ml_name = "get_sector",
         .ml_meth = terrain_get_sector,
@@ -384,15 +413,15 @@ var terrain_type_spec = py.PyType_Spec{
 
 fn parse_terrain_py(self: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
     _ = self;
-    
+
     //Read the args, check the format, fill in the zig ids with the unpacked result.
-    const bytestream: []u8 = blk:{
+    const bytestream: []u8 = blk: {
         var bytestream_raw: [*]u8 = undefined;
         var bytestream_len_raw: py.Py_ssize_t = undefined;
         if (py.PyArg_ParseTuple(args, "y#", &bytestream_raw, &bytestream_len_raw) == 0) return null; // Python exception already set
         break :blk bytestream_raw[0..@intCast(bytestream_len_raw)];
     };
-    
+
     var fixed: XaReader = .fixed(bytestream);
 
     const terrain_ptr = std.heap.c_allocator.create(Terrain) catch {
@@ -436,7 +465,7 @@ var module = py.PyModuleDef{
 
 export fn PyInit_x_rft_zig() callconv(.c) ?*py.PyObject {
     const mod = py.PyModule_Create(&module) orelse return null;
-    
+
     //the PyMethodDef goes into the PyType_Slot which go into the PyType_Spec which goes into this
     const type_obj = pyo.TypeObject.fromSpec(&terrain_type_spec) catch |err| switch (err) {
         error.Failed => {

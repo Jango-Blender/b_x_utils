@@ -126,6 +126,7 @@ class RFP:
             print(f'Failed to find image {image_name} in texture rpks {self.textures}')
             return None
     def get_set(self, set_name: str) -> SortedTileset:
+        print(f'Attempting to get tileset {set_name}')
         import_name = set_name
         set_name = set_name[:-4].lower() #Cut off .rfc and make it lowercase.
         #Store them in the blend file and reuse them. Prevents performing these expensive mergers.

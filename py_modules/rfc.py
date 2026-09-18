@@ -106,22 +106,21 @@ def get_nibbles_from_bytes(data: bytes) -> list[int]:
 
 def build_terrain_sector(rft, pos_x: int, pos_y: int, col: bpy.types.Collection, mat: bpy.types.Material, built_brushes: list[str]) -> bpy.types.Object:
     tmesh = bpy.data.meshes.new(f'Terrain-{pos_x}-{pos_y}')
-    try: 
-        verts,faces,brushes = rft.get_sector(pos_x,pos_y)
-    except:
-        return None
-    else:
-        tmesh.from_pydata(verts,[],faces)
-        for name,weights in brushes:
-            if name not in built_brushes: 
-                # print(f'Brush ({repr(name)}) is not in the built brushes: {built_brushes}')
-                continue
-            attr = tmesh.attributes.new(name, 'FLOAT', 'POINT')
-            attr.data.foreach_set("value", weights)
-        tmesh.materials.append(mat)
-        obj = bf.create_object(name = f'Terrain-{pos_x}-{pos_y}',data = tmesh)
-        col.objects.link(obj)
-        return obj
+    verts,faces,brushes,holemap = rft.get_sector(pos_x,pos_y)
+    # print(holemap)
+    tmesh.from_pydata(verts,[],faces)
+    for name,weights in brushes:
+        if name not in built_brushes: 
+            # print(f'Brush ({repr(name)}) is not in the built brushes: {built_brushes}')
+            continue
+        attr = tmesh.attributes.new(name, 'FLOAT', 'POINT')
+        attr.data.foreach_set("value", weights)
+    holemap_attr = tmesh.attributes.new('Holemap','INT','POINT')
+    holemap_attr.data.foreach_set('value',holemap)
+    tmesh.materials.append(mat)
+    obj = bf.create_object(name = f'Terrain-{pos_x}-{pos_y}',data = tmesh)
+    col.objects.link(obj)
+    return obj
 
 def parse_tilemap(rfp: RFP, name: str, file: BufferedReader, scene: bpy.types.Scene, import_settings: dict[str,bool], length: int, *args, **kwargs) -> tuple[str,None]:
     if not import_settings['import_sectors']: 
@@ -209,7 +208,7 @@ def build_node(rfp: RFP, file: BufferedReader, rfc_sig: int, col: bpy.types.Coll
     bbox_pos   = read_3dfvec(file)
     if rfc_sig == 0x3D23AFCF: float_a,objint = unpack('<f L', file.read(8)) #0x74 bytes long
     else: objint,float_a = read_uints(file,1),0 #0x70 Bytes long;
-    # print(f'Reading node data @ {hex(file.tell())}')
+    # print(f'Reading node data @ {hex(file.tell())} in {file.name}')
     file_data = file.read(length - (file.tell() - start))
     if suppress: data = nodes[suppress-1].data
     elif node_type == 0x3D03: #Mesh
